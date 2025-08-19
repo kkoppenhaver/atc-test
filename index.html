@@ -107,6 +107,7 @@
     let ctx, src, master, hp, lp, comp, clip, crush, outGain;
     let noiseSrc, noiseGain, noiseHP;
     let analyser, rmsTimer, lastActive = false, lastSilenceTs = 0;
+    let rmsHistory = []; // Track RMS over time for stability
 
     async function ensureContext() {
       if (ctx) return ctx;
@@ -163,12 +164,12 @@
       noiseHP.frequency.value = 500;
 
       noiseGain = ctx.createGain();
-      noiseGain.gain.value = 0.1; // baseline hiss level; we’ll duck this
+      noiseGain.gain.value = 0.08; // baseline hiss level; we’ll duck this
 
       // Analyser for envelope detection
       analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.05;
+      analyser.smoothingTimeConstant = 0.2; // More smoothing
 
       // Wire main program chain
       // src -> hp -> lp -> comp -> clip -> [crush] -> outGain -> master
@@ -201,8 +202,9 @@
 
     function startRmsLoop() {
       const buf = new Float32Array(analyser.fftSize);
-      const SILENCE_RMS = 0.015; // threshold; adjust with intensity
-      const CHECK_MS = 30;
+      const SILENCE_RMS = 0.025; // Higher threshold for more stability
+      const CHECK_MS = 50; // Slower checks
+      const HISTORY_LENGTH = 5; // Average over several samples
 
       function tick() {
         analyser.getFloatTimeDomainData(buf);
@@ -211,31 +213,35 @@
         for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
         const rms = Math.sqrt(sum / buf.length);
 
-        const isActive = rms > SILENCE_RMS;
+        // Keep RMS history for smoothing
+        rmsHistory.push(rms);
+        if (rmsHistory.length > HISTORY_LENGTH) rmsHistory.shift();
+        
+        // Use averaged RMS for stability
+        const avgRms = rmsHistory.reduce((a, b) => a + b, 0) / rmsHistory.length;
+        const isActive = avgRms > SILENCE_RMS;
         const now = ctx.currentTime;
 
-        // Duck noise during speech; bring it back on silence with squelch tail
-        if (isActive) {
-          // noise duck
+        // Only change state if it's been stable for a few samples
+        const stableActive = rmsHistory.slice(-3).every(r => r > SILENCE_RMS);
+        const stableSilent = rmsHistory.slice(-3).every(r => r <= SILENCE_RMS);
+
+        if (stableActive && !lastActive) {
+          // Transition to active: duck noise
           noiseGain.gain.cancelScheduledValues(now);
-          noiseGain.gain.setTargetAtTime(0.02, now, 0.015); // quick duck
+          noiseGain.gain.setTargetAtTime(0.015, now, 0.02); // gentle duck
           lastActive = true;
-        } else {
-          if (lastActive) {
-            // Just transitioned to silence: brief squelch tail burst
-            lastSilenceTs = now;
-            noiseGain.gain.cancelScheduledValues(now);
-            noiseGain.gain.setValueAtTime(0.18, now);
-            noiseGain.gain.setTargetAtTime(0.10, now + 0.05, 0.05); // decay
-            // tiny "click"
-            click(0.004, 1200);
-          } else {
-            // steady silence: settle to baseline hiss
-            noiseGain.gain.cancelScheduledValues(now);
-            noiseGain.gain.setTargetAtTime(0.10, now, 0.2);
-          }
+        } else if (stableSilent && lastActive) {
+          // Just transitioned to silence: brief squelch tail burst
+          lastSilenceTs = now;
+          noiseGain.gain.cancelScheduledValues(now);
+          noiseGain.gain.setValueAtTime(0.12, now); // Smaller burst
+          noiseGain.gain.setTargetAtTime(0.08, now + 0.04, 0.08); // gentler decay
+          // tiny "click"
+          click(0.003, 1200);
           lastActive = false;
         }
+        // If neither condition is met, maintain current state (no fluctuation)
 
         rmsTimer = setTimeout(tick, CHECK_MS);
       }
@@ -246,10 +252,10 @@
       const o = ctx.createOscillator();
       const g = ctx.createGain();
       o.frequency.value = freq;
-      g.gain.value = 0.25;
+      g.gain.value = 0.15; // Quieter click
       o.connect(g).connect(master);
       const now = ctx.currentTime;
-      g.gain.setValueAtTime(0.3, now);
+      g.gain.setValueAtTime(0.15, now);
       g.gain.exponentialRampToValueAtTime(0.0001, now + duration);
       o.start(now);
       o.stop(now + duration);
