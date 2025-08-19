@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ATC Radio Effect</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; }
+    .row { display: flex; gap: 16px; align-items: center; margin: 12px 0; }
+    label { width: 160px; }
+    input[type=range] { width: 260px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ddd; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>ATC Radio Effect (Live)</h1>
+
+  <!-- Point this at your live stream URL -->
+  <audio id="player" crossorigin="anonymous" playsinline></audio>
+
+  <div class="row">
+    <label>Stream URL</label>
+    <input id="url" type="text" style="width:420px"
+           placeholder="https://example.com/live.mp3" />
+    <button id="load">Load</button>
+    <button id="toggle">Play</button>
+  </div>
+
+  <div class="row">
+    <label>Effect On</label>
+    <input id="enabled" type="checkbox" checked />
+  </div>
+
+  <div class="row">
+    <label>Intensity</label>
+    <input id="intensity" type="range" min="0" max="1" step="0.01" value="0.7" />
+    <span id="ival">0.70</span>
+  </div>
+
+  <script>
+    // --- utilities ---
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+    // Soft clipper (tanh-ish)
+    function makeSoftClipCurve(amount = 0.6) {
+      const n = 2048, curve = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const x = (i / (n - 1)) * 2 - 1;
+        curve[i] = Math.tanh(x * (1 + amount * 4));
+      }
+      return curve;
+    }
+
+    // Generate a looped white-noise buffer
+    function makeNoiseBuffer(ctx, seconds = 2) {
+      const length = seconds * ctx.sampleRate;
+      const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < length; i++) data[i] = (Math.random() * 2 - 1) * 0.35; // modest level
+      return buffer;
+    }
+
+    // Optional Bitcrusher via AudioWorklet (very mild by default)
+    const workletCode = `
+      class BitCrusher extends AudioWorkletProcessor {
+        static get parameterDescriptors() {
+          return [
+            { name: 'bits', defaultValue: 10, minValue: 1, maxValue: 16, automationRate: 'k-rate' },
+            { name: 'reduction', defaultValue: 0.25, minValue: 0.01, maxValue: 1.0, automationRate: 'k-rate' }
+          ];
+        }
+        constructor() { super(); this.phase = 0; this.last = 0; }
+        process(inputs, outputs, parameters) {
+          const input = inputs[0], output = outputs[0];
+          if (!input.length) return true;
+          for (let ch = 0; ch < output.length; ch++) {
+            const inChan = input[ch] || input[0];
+            const outChan = output[ch];
+            const bits = parameters.bits[0];
+            const reduction = parameters.reduction[0];
+            const steps = Math.pow(2, bits) - 1;
+            for (let i = 0; i < outChan.length; i++) {
+              this.phase += reduction;
+              if (this.phase >= 1.0) {
+                this.phase -= 1.0;
+                const s = Math.max(-1, Math.min(1, inChan[i]));
+                this.last = (Math.round((s + 1) * 0.5 * steps) / steps) * 2 - 1;
+              }
+              outChan[i] = this.last;
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('bitcrusher', BitCrusher);
+    `;
+
+    // --- main wiring ---
+    const audio = document.getElementById('player');
+    const urlInput = document.getElementById('url');
+    const loadBtn = document.getElementById('load');
+    const toggleBtn = document.getElementById('toggle');
+    const enabled = document.getElementById('enabled');
+    const intensity = document.getElementById('intensity');
+    const ival = document.getElementById('ival');
+
+    let ctx, src, master, hp, lp, comp, clip, crush, outGain;
+    let noiseSrc, noiseGain, noiseHP;
+    let analyser, rmsTimer, lastActive = false, lastSilenceTs = 0;
+
+    async function ensureContext() {
+      if (ctx) return ctx;
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+      // Try to register the bitcrusher worklet
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      const moduleURL = URL.createObjectURL(blob);
+      try { await ctx.audioWorklet.addModule(moduleURL); } catch (e) { /* Bitcrusher optional */ }
+
+      // Graph nodes
+      src     = ctx.createMediaElementSource(audio);
+      master  = ctx.createGain();
+      outGain = ctx.createGain();
+
+      // Band-limiting
+      hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 250;
+
+      lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 3400;
+
+      // Fast compressor (AGC-ish)
+      comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -22;  // dB
+      comp.knee.value      = 24;
+      comp.ratio.value     = 8;    // fairly strong
+      comp.attack.value    = 0.003;
+      comp.release.value   = 0.25;
+
+      // Soft clipper
+      clip = ctx.createWaveShaper();
+      clip.curve = makeSoftClipCurve(0.6);
+      clip.oversample = '4x';
+
+      // Optional bitcrusher
+      crush = (ctx.audioWorklet && ctx.createAudioWorkletNode)
+              ? new AudioWorkletNode(ctx, 'bitcrusher', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] })
+              : null;
+      if (crush) {
+        crush.parameters.get('bits').value = 10;       // mild
+        crush.parameters.get('reduction').value = 0.2; // sample & hold
+      }
+
+      // Noise bus
+      noiseSrc = ctx.createBufferSource();
+      noiseSrc.buffer = makeNoiseBuffer(ctx, 2);
+      noiseSrc.loop = true;
+
+      noiseHP = ctx.createBiquadFilter();
+      noiseHP.type = 'highpass';
+      noiseHP.frequency.value = 500;
+
+      noiseGain = ctx.createGain();
+      noiseGain.gain.value = 0.1; // baseline hiss level; we’ll duck this
+
+      // Analyser for envelope detection
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.05;
+
+      // Wire main program chain
+      // src -> hp -> lp -> comp -> clip -> [crush] -> outGain -> master
+      if (crush) {
+        src.connect(hp).connect(lp).connect(comp).connect(clip).connect(crush).connect(outGain).connect(master);
+      } else {
+        src.connect(hp).connect(lp).connect(comp).connect(clip).connect(outGain).connect(master);
+      }
+
+      // Tap analyser post-clip (pre-noise mix)
+      clip.connect(analyser);
+
+      // Noise path
+      noiseSrc.connect(noiseHP).connect(noiseGain).connect(master);
+
+      // Master to destination
+      master.connect(ctx.destination);
+
+      // Start noise
+      noiseSrc.start();
+
+      // Start RMS watcher
+      startRmsLoop();
+
+      // Initial intensity
+      setIntensity(parseFloat(intensity.value));
+
+      return ctx;
+    }
+
+    function startRmsLoop() {
+      const buf = new Float32Array(analyser.fftSize);
+      const SILENCE_RMS = 0.015; // threshold; adjust with intensity
+      const CHECK_MS = 30;
+
+      function tick() {
+        analyser.getFloatTimeDomainData(buf);
+        // RMS
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+
+        const isActive = rms > SILENCE_RMS;
+        const now = ctx.currentTime;
+
+        // Duck noise during speech; bring it back on silence with squelch tail
+        if (isActive) {
+          // noise duck
+          noiseGain.gain.cancelScheduledValues(now);
+          noiseGain.gain.setTargetAtTime(0.02, now, 0.015); // quick duck
+          lastActive = true;
+        } else {
+          if (lastActive) {
+            // Just transitioned to silence: brief squelch tail burst
+            lastSilenceTs = now;
+            noiseGain.gain.cancelScheduledValues(now);
+            noiseGain.gain.setValueAtTime(0.18, now);
+            noiseGain.gain.setTargetAtTime(0.10, now + 0.05, 0.05); // decay
+            // tiny "click"
+            click(0.004, 1200);
+          } else {
+            // steady silence: settle to baseline hiss
+            noiseGain.gain.cancelScheduledValues(now);
+            noiseGain.gain.setTargetAtTime(0.10, now, 0.2);
+          }
+          lastActive = false;
+        }
+
+        rmsTimer = setTimeout(tick, CHECK_MS);
+      }
+      tick();
+    }
+
+    function click(duration = 0.006, freq = 1000) {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.frequency.value = freq;
+      g.gain.value = 0.25;
+      o.connect(g).connect(master);
+      const now = ctx.currentTime;
+      g.gain.setValueAtTime(0.3, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+      o.start(now);
+      o.stop(now + duration);
+    }
+
+    function setIntensity(v) {
+      v = clamp(v, 0, 1);
+      ival.textContent = v.toFixed(2);
+
+      // Map intensity to parameters
+      const hpF = 200 + v * 200;      // 200–400 Hz
+      const lpF = 3200 - v * 400;     // 3200 down to ~2800 Hz
+      hp.frequency.setTargetAtTime(hpF, ctx.currentTime, 0.05);
+      lp.frequency.setTargetAtTime(lpF, ctx.currentTime, 0.05);
+
+      comp.threshold.setTargetAtTime(-26 + v * 6, ctx.currentTime, 0.05); // -26 to -20
+      comp.ratio.setTargetAtTime(6 + v * 6, ctx.currentTime, 0.05);       // 6:1 to 12:1
+      comp.attack.setTargetAtTime(0.002 + v * 0.002, ctx.currentTime, 0.05);
+      comp.release.setTargetAtTime(0.18 + v * 0.18, ctx.currentTime, 0.05);
+
+      clip.curve = makeSoftClipCurve(0.4 + v * 0.4);
+
+      if (crush) {
+        crush.parameters.get('bits').value = 12 - Math.floor(v * 4);       // 12 -> 8
+        crush.parameters.get('reduction').value = 0.15 + v * 0.25;         // more downsample
+      }
+
+      // Overall program level (keep consistent perceived loudness)
+      outGain.gain.setTargetAtTime(0.9 - v * 0.2, ctx.currentTime, 0.05);
+    }
+
+    // UI wires
+    loadBtn.onclick = async () => {
+      await ensureContext();
+      if (urlInput.value) {
+        audio.src = urlInput.value;
+      }
+    };
+
+    toggleBtn.onclick = async () => {
+      await ensureContext();
+      if (ctx.state === 'suspended') await ctx.resume();
+      if (audio.paused) {
+        audio.play();
+        toggleBtn.textContent = 'Pause';
+      } else {
+        audio.pause();
+        toggleBtn.textContent = 'Play';
+      }
+    };
+
+    intensity.oninput = () => {
+      if (!ctx) return;
+      setIntensity(parseFloat(intensity.value));
+    };
+
+    enabled.onchange = () => {
+      if (!ctx) return;
+      if (enabled.checked) {
+        master.connect(ctx.destination);
+      } else {
+        master.disconnect();
+      }
+    };
+
+    // Sensible defaults for a quick test (drop in any public MP3 stream here)
+    urlInput.value = '';
+  </script>
+</body>
+</html>
